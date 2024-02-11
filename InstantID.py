@@ -280,6 +280,32 @@ class InstantIDFaceAnalysis:
     CATEGORY = "InstantID"
 
     def load_insight_face(self, provider):
+        import pathlib
+        antelope_location = os.path.join(INSIGHTFACE_DIR, "models/antelopev2")
+        antelope_location = pathlib.Path(antelope_location)
+
+        if not antelope_location.exists():
+            from huggingface_hub import hf_hub_download
+
+            antelope_location.mkdir(parents=True)
+
+            files = [
+                "1k3d68.onnx",
+                "2d106det.onnx",
+                "genderage.onnx",
+                "glintr100.onnx",
+                "scrfd_10g_bnkps.onnx"
+            ]
+
+            for file in files:
+                    hf_hub_download(
+                        local_dir=antelope_location,
+                        local_dir_use_symlinks=False,
+                        repo_id="DIAMONIK7777/antelopev2",
+                        filename=file,
+                        repo_type="model"
+                    )
+
         model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # buffalo_l
         model.prepare(ctx_id=0, det_size=(640, 640))
 
