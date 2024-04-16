@@ -6,12 +6,17 @@ import numpy as np
 import math
 import cv2
 import PIL.Image
-from comfy.ldm.modules.attention import optimized_attention
 from .resampler import Resampler
+from .CrossAttentionPatch import CrossAttentionPatch
+from .utils import tensor_to_image
 
 from insightface.app import FaceAnalysis
 
-import torchvision.transforms.v2 as T
+try:
+    import torchvision.transforms.v2 as T
+except ImportError:
+    import torchvision.transforms as T
+
 import torch.nn.functional as F
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "instantid")
@@ -50,85 +55,6 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
 
     out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
-
-class CrossAttentionPatch:
-    # forward for patching
-    def __init__(self, weight, instantid, number, cond, uncond, mask=None, sigma_start=0.0, sigma_end=1.0):
-        self.weights = [weight]
-        self.instantid = [instantid]
-        self.conds = [cond]
-        self.unconds = [uncond]
-        self.number = number
-        self.masks = [mask]
-        self.sigma_start = [sigma_start]
-        self.sigma_end = [sigma_end]
-
-        self.k_key = str(self.number*2+1) + "_to_k_ip"
-        self.v_key = str(self.number*2+1) + "_to_v_ip"
-    
-    def set_new_condition(self, weight, instantid, number, cond, uncond, mask=None, sigma_start=0.0, sigma_end=1.0):
-        self.weights.append(weight)
-        self.instantid.append(instantid)
-        self.conds.append(cond)
-        self.unconds.append(uncond)
-        self.masks.append(mask)
-        self.sigma_start.append(sigma_start)
-        self.sigma_end.append(sigma_end)
-
-    def __call__(self, n, context_attn2, value_attn2, extra_options):
-        org_dtype = n.dtype
-        cond_or_uncond = extra_options["cond_or_uncond"]
-        
-        sigma = extra_options["sigmas"][0] if 'sigmas' in extra_options else None
-        sigma = sigma.item() if sigma else 999999999.9
-
-        q = n
-        k = context_attn2
-        v = value_attn2
-        b = q.shape[0]
-        qs = q.shape[1]
-        batch_prompt = b // len(cond_or_uncond)
-        out = optimized_attention(q, k, v, extra_options["n_heads"])
-        _, _, lh, lw = extra_options["original_shape"]
-        
-        for weight, cond, uncond, instantid, mask, sigma_start, sigma_end in zip(self.weights, self.conds, self.unconds, self.instantid, self.masks, self.sigma_start, self.sigma_end):
-            if sigma < sigma_start and sigma > sigma_end:
-                k_cond = instantid.ip_layers.to_kvs[self.k_key](cond).repeat(batch_prompt, 1, 1)
-                k_uncond = instantid.ip_layers.to_kvs[self.k_key](uncond).repeat(batch_prompt, 1, 1)
-                v_cond = instantid.ip_layers.to_kvs[self.v_key](cond).repeat(batch_prompt, 1, 1)
-                v_uncond = instantid.ip_layers.to_kvs[self.v_key](uncond).repeat(batch_prompt, 1, 1)
-
-                iid_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0)
-                iid_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
-
-                out_iid = optimized_attention(q, iid_k, iid_v, extra_options["n_heads"])           
-                out_iid = out_iid * weight
-
-                if mask is not None:
-                    # TODO: needs checking
-                    mask_h = lh / math.sqrt(lh * lw / qs)
-                    mask_h = int(mask_h) + int((qs % int(mask_h)) != 0)
-                    mask_w = qs // mask_h
-
-                    mask_downsample = F.interpolate(mask.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-
-                    # if we don't have enough masks repeat the last one until we reach the right size
-                    if mask_downsample.shape[0] < batch_prompt:
-                        mask_downsample = torch.cat((mask_downsample, mask_downsample[-1:, :, :].repeat((batch_prompt-mask_downsample.shape[0], 1, 1))), dim=0)
-                    # if we have too many remove the exceeding
-                    elif mask_downsample.shape[0] > batch_prompt:
-                        mask_downsample = mask_downsample[:batch_prompt, :, :]
-                    
-                    # repeat the masks
-                    mask_downsample = mask_downsample.repeat(len(cond_or_uncond), 1, 1)
-                    mask_downsample = mask_downsample.view(mask_downsample.shape[0], -1, 1).repeat(1, 1, out.shape[2])
-
-                    out_iid = out_iid * mask_downsample
-
-                out = out + out_iid
-
-        return out.to(dtype=org_dtype)
-
 
 class InstantID(torch.nn.Module):
     def __init__(self, instantid_model, cross_attention_dim=1280, output_cross_attention_dim=1024, clip_embeddings_dim=512, clip_extra_context_tokens=16):
@@ -169,12 +95,12 @@ class InstantID(torch.nn.Module):
 class ImageProjModel(torch.nn.Module):
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4):
         super().__init__()
-        
+
         self.cross_attention_dim = cross_attention_dim
         self.clip_extra_context_tokens = clip_extra_context_tokens
         self.proj = torch.nn.Linear(clip_embeddings_dim, self.clip_extra_context_tokens * cross_attention_dim)
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
-        
+
     def forward(self, image_embeds):
         embeds = image_embeds
         clip_extra_context_tokens = self.proj(embeds).reshape(-1, self.clip_extra_context_tokens, self.cross_attention_dim)
@@ -191,15 +117,14 @@ class To_KV(torch.nn.Module):
             self.to_kvs[k] = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
             self.to_kvs[k].weight.data = value
 
-def set_model_patch_replace(model, patch_kwargs, key):
+def _set_model_patch_replace(model, patch_kwargs, key):
     to = model.model_options["transformer_options"]
     if "patches_replace" not in to:
         to["patches_replace"] = {}
     if "attn2" not in to["patches_replace"]:
         to["patches_replace"]["attn2"] = {}
     if key not in to["patches_replace"]["attn2"]:
-        patch = CrossAttentionPatch(**patch_kwargs)
-        to["patches_replace"]["attn2"][key] = patch
+        to["patches_replace"]["attn2"][key] = CrossAttentionPatch(**patch_kwargs)
     else:
         to["patches_replace"]["attn2"][key].set_new_condition(**patch_kwargs)
 
@@ -225,17 +150,11 @@ class InstantIDModelLoader:
                 elif key.startswith("ip_adapter."):
                     st_model["ip_adapter"][key.replace("ip_adapter.", "")] = model[key]
             model = st_model
-        
+
         return (model,)
 
-def tensorToNP(image):
-    out = torch.clamp(255. * image.detach().cpu(), 0, 255).to(torch.uint8)
-    out = out[..., [2, 1, 0]]
-    out = out.numpy()
-    return out
-
 def extractFeatures(insightface, image, extract_kps=False):
-    face_img = tensorToNP(image)
+    face_img = tensor_to_image(image)
     out = []
 
     insightface.det_model.input_size = (640,640) # reset the detection size
@@ -245,7 +164,7 @@ def extractFeatures(insightface, image, extract_kps=False):
             insightface.det_model.input_size = size # TODO: hacky but seems to be working
             face = insightface.get(face_img[i])
             if face:
-                face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*x['bbox'][3]-x['bbox'][1])[-1]
+                face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
 
                 if extract_kps:
                     out.append(draw_kps(face_img[i], face['kps']))
@@ -307,6 +226,7 @@ class InstantIDFaceAnalysis:
                     )
 
         model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # buffalo_l
+
         model.prepare(ctx_id=0, det_size=(640, 640))
 
         return (model,)
@@ -334,6 +254,15 @@ class FaceKeypointsPreprocessor:
 
         return (face_kps,)
 
+def add_noise(image, factor):
+    seed = int(torch.sum(image).item()) % 1000000007
+    torch.manual_seed(seed)
+    mask = (torch.rand_like(image) < factor).float()
+    noise = torch.rand_like(image)
+    noise = torch.zeros_like(image) * (1-mask) + noise * mask
+
+    return factor*noise
+
 class ApplyInstantID:
     @classmethod
     def INPUT_TYPES(s):
@@ -341,43 +270,68 @@ class ApplyInstantID:
             "required": {
                 "instantid": ("INSTANTID", ),
                 "insightface": ("FACEANALYSIS", ),
-                "image_features": ("IMAGE", ),
+                "control_net": ("CONTROL_NET", ),
+                "image": ("IMAGE", ),
                 "model": ("MODEL", ),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
-                "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,}),
-                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,}),
-                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001,}),
+                "weight": ("FLOAT", {"default": .8, "min": 0.0, "max": 5.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
             },
             "optional": {
-                "attn_mask": ("MASK",),
+                "image_kps": ("IMAGE",),
+                "mask": ("MASK",),
             }
         }
 
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING",)
-    RETURN_NAMES = ("MODEL", "POSITIVE", "NEGATIVE", )
+    RETURN_NAMES = ("MODEL", "positive", "negative", )
     FUNCTION = "apply_instantid"
     CATEGORY = "InstantID"
 
-    def apply_instantid(self, instantid, insightface, image_features, model, positive, negative, weight, start_at, end_at, attn_mask=None):
+    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average'):
         self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
         self.device = comfy.model_management.get_torch_device()
-        self.weight = weight
+
+        ip_weight = weight if ip_weight is None else ip_weight
+        cn_strength = weight if cn_strength is None else cn_strength
 
         output_cross_attention_dim = instantid["ip_adapter"]["1.to_k_ip.weight"].shape[1]
         is_sdxl = output_cross_attention_dim == 2048
         cross_attention_dim = 1280
         clip_extra_context_tokens = 16
 
-        face_embed = extractFeatures(insightface, image_features)
+        face_embed = extractFeatures(insightface, image)
         if face_embed is None:
-            raise Exception('Feature Extractor: No face detected.')
+            raise Exception('Reference Image: No face detected.')
+
+        # if no keypoints image is provided, use the image itself (only the first one in the batch)
+        face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
+
+        if face_kps is None:
+            face_kps = torch.zeros_like(image) if image_kps is None else image_kps
+            print(f"\033[33mWARNING: No face detected in the keypoints image!\033[0m")
 
         clip_embed = face_embed
-        clip_embed_zeroed = torch.zeros_like(clip_embed)
+        # InstantID works better with averaged embeds (TODO: needs testing)
+        if clip_embed.shape[0] > 1:
+            if combine_embeds == 'average':
+                clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+            elif combine_embeds == 'norm average':
+                clip_embed = torch.mean(clip_embed / torch.norm(clip_embed, dim=0, keepdim=True), dim=0).unsqueeze(0)
+
+        if noise > 0:
+            seed = int(torch.sum(clip_embed).item()) % 1000000007
+            torch.manual_seed(seed)
+            clip_embed_zeroed = noise * torch.rand_like(clip_embed)
+            #clip_embed_zeroed = add_noise(clip_embed, noise)
+        else:
+            clip_embed_zeroed = torch.zeros_like(clip_embed)
 
         clip_embeddings_dim = face_embed.shape[-1]
 
+        # 1: patch the attention
         self.instantid = InstantID(
             instantid,
             cross_attention_dim=cross_attention_dim,
@@ -395,72 +349,311 @@ class ApplyInstantID:
 
         work_model = model.clone()
 
-        sigma_start = work_model.model.model_sampling.percent_to_sigma(start_at)
-        sigma_end = work_model.model.model_sampling.percent_to_sigma(end_at)
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
-        if attn_mask is not None:
-            attn_mask = attn_mask.to(self.device)
+        if mask is not None:
+            mask = mask.to(self.device)
 
         patch_kwargs = {
+            "ipadapter": self.instantid,
             "number": 0,
-            "weight": self.weight,
-            "instantid": self.instantid,
+            "weight": ip_weight,
             "cond": image_prompt_embeds,
             "uncond": uncond_image_prompt_embeds,
-            "mask": attn_mask,
+            "mask": mask,
             "sigma_start": sigma_start,
             "sigma_end": sigma_end,
         }
 
         if not is_sdxl:
             for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
-                set_model_patch_replace(work_model, patch_kwargs, ("input", id))
+                _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
                 patch_kwargs["number"] += 1
             for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
-                set_model_patch_replace(work_model, patch_kwargs, ("output", id))
+                _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
                 patch_kwargs["number"] += 1
-            set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
+            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
         else:
             for id in [4,5,7,8]: # id of input_blocks that have cross attention
                 block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
                 for index in block_indices:
-                    set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
                     patch_kwargs["number"] += 1
             for id in range(6): # id of output_blocks that have cross attention
                 block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
                 for index in block_indices:
-                    set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
                     patch_kwargs["number"] += 1
             for index in range(10):
-                set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
                 patch_kwargs["number"] += 1
 
-        pos = []
-        for t in positive:
-            n = [t[0], t[1].copy()]
-            n[1]['cross_attn_controlnet'] = image_prompt_embeds.cpu()
-            pos.append(n)
-        #pos[0][1]['cross_attn_controlnet'] = image_prompt_embeds.cpu()
-        
-        neg = []
-        for t in negative:
-            n = [t[0], t[1].copy()]
-            n[1]['cross_attn_controlnet'] = uncond_image_prompt_embeds.cpu()
-            neg.append(n)
-        #neg[0][1]['cross_attn_controlnet'] = uncond_image_prompt_embeds.cpu()
+        # 2: do the ControlNet
+        if mask is not None and len(mask.shape) < 3:
+            mask = mask.unsqueeze(0)
 
-        return(work_model, pos, neg, )
+        cnets = {}
+        cond_uncond = []
+
+        is_cond = True
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+
+                prev_cnet = d.get('control', None)
+                if prev_cnet in cnets:
+                    c_net = cnets[prev_cnet]
+                else:
+                    c_net = control_net.copy().set_cond_hint(face_kps.movedim(-1,1), cn_strength, (start_at, end_at))
+                    c_net.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net
+
+                d['control'] = c_net
+                d['control_apply_to_uncond'] = False
+                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device()) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device())
+
+                if mask is not None and is_cond:
+                    d['mask'] = mask
+                    d['set_area_to_bounds'] = False
+
+                n = [t[0], d]
+                c.append(n)
+            cond_uncond.append(c)
+            is_cond = False
+
+        return(work_model, cond_uncond[0], cond_uncond[1], )
+
+class ApplyInstantIDAdvanced(ApplyInstantID):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "instantid": ("INSTANTID", ),
+                "insightface": ("FACEANALYSIS", ),
+                "control_net": ("CONTROL_NET", ),
+                "image": ("IMAGE", ),
+                "model": ("MODEL", ),
+                "positive": ("CONDITIONING", ),
+                "negative": ("CONDITIONING", ),
+                "ip_weight": ("FLOAT", {"default": .8, "min": 0.0, "max": 3.0, "step": 0.01, }),
+                "cn_strength": ("FLOAT", {"default": .8, "min": 0.0, "max": 10.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, }),
+                "combine_embeds": (['average', 'norm average', 'concat'], {"default": 'average'}),
+            },
+            "optional": {
+                "image_kps": ("IMAGE",),
+                "mask": ("MASK",),
+            }
+        }
+
+class InstantIDAttentionPatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "instantid": ("INSTANTID", ),
+                "insightface": ("FACEANALYSIS", ),
+                "image": ("IMAGE", ),
+                "model": ("MODEL", ),
+                "weight": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 3.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, }),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "FACE_EMBEDS")
+    FUNCTION = "patch_attention"
+    CATEGORY = "InstantID"
+
+    def patch_attention(self, instantid, insightface, image, model, weight, start_at, end_at, noise=0.0, mask=None):
+        self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        self.device = comfy.model_management.get_torch_device()
+
+        output_cross_attention_dim = instantid["ip_adapter"]["1.to_k_ip.weight"].shape[1]
+        is_sdxl = output_cross_attention_dim == 2048
+        cross_attention_dim = 1280
+        clip_extra_context_tokens = 16
+
+        face_embed = extractFeatures(insightface, image)
+        if face_embed is None:
+            raise Exception('Reference Image: No face detected.')
+
+        clip_embed = face_embed
+        # InstantID works better with averaged embeds (TODO: needs testing)
+        if clip_embed.shape[0] > 1:
+            clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+
+        if noise > 0:
+            seed = int(torch.sum(clip_embed).item()) % 1000000007
+            torch.manual_seed(seed)
+            clip_embed_zeroed = noise * torch.rand_like(clip_embed)
+        else:
+            clip_embed_zeroed = torch.zeros_like(clip_embed)
+
+        clip_embeddings_dim = face_embed.shape[-1]
+
+        # 1: patch the attention
+        self.instantid = InstantID(
+            instantid,
+            cross_attention_dim=cross_attention_dim,
+            output_cross_attention_dim=output_cross_attention_dim,
+            clip_embeddings_dim=clip_embeddings_dim,
+            clip_extra_context_tokens=clip_extra_context_tokens,
+        )
+
+        self.instantid.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+
+        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+
+        if weight == 0:
+            return (model, { "cond": image_prompt_embeds, "uncond": uncond_image_prompt_embeds } )
+
+        work_model = model.clone()
+
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+        if mask is not None:
+            mask = mask.to(self.device)
+
+        patch_kwargs = {
+            "number": 0,
+            "weight": weight,
+            "ipadapter": self.instantid,
+            "cond": image_prompt_embeds,
+            "uncond": uncond_image_prompt_embeds,
+            "mask": mask,
+            "sigma_start": sigma_start,
+            "sigma_end": sigma_end,
+        }
+
+        if not is_sdxl:
+            for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
+                _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
+                patch_kwargs["number"] += 1
+            for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
+                _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
+                patch_kwargs["number"] += 1
+            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
+        else:
+            for id in [4,5,7,8]: # id of input_blocks that have cross attention
+                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                    patch_kwargs["number"] += 1
+            for id in range(6): # id of output_blocks that have cross attention
+                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                    patch_kwargs["number"] += 1
+            for index in range(10):
+                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+                patch_kwargs["number"] += 1
+
+        return(work_model, { "cond": image_prompt_embeds, "uncond": uncond_image_prompt_embeds }, )
+
+class ApplyInstantIDControlNet:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "face_embeds": ("FACE_EMBEDS", ),
+                "control_net": ("CONTROL_NET", ),
+                "image_kps": ("IMAGE", ),
+                "positive": ("CONDITIONING", ),
+                "negative": ("CONDITIONING", ),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING",)
+    RETURN_NAMES = ("positive", "negative", )
+    FUNCTION = "apply_controlnet"
+    CATEGORY = "InstantID"
+
+    def apply_controlnet(self, face_embeds, control_net, image_kps, positive, negative, strength, start_at, end_at, mask=None):
+        self.device = comfy.model_management.get_torch_device()
+
+        if strength == 0:
+            return (positive, negative)
+
+        if mask is not None:
+            mask = mask.to(self.device)
+
+        if mask is not None and len(mask.shape) < 3:
+            mask = mask.unsqueeze(0)
+
+        image_prompt_embeds = face_embeds['cond']
+        uncond_image_prompt_embeds = face_embeds['uncond']
+
+        cnets = {}
+        cond_uncond = []
+        control_hint = image_kps.movedim(-1,1)
+
+        is_cond = True
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+
+                prev_cnet = d.get('control', None)
+                if prev_cnet in cnets:
+                    c_net = cnets[prev_cnet]
+                else:
+                    c_net = control_net.copy().set_cond_hint(control_hint, strength, (start_at, end_at))
+                    c_net.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net
+
+                d['control'] = c_net
+                d['control_apply_to_uncond'] = False
+                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device()) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device())
+
+                if mask is not None and is_cond:
+                    d['mask'] = mask
+                    d['set_area_to_bounds'] = False
+
+                n = [t[0], d]
+                c.append(n)
+            cond_uncond.append(c)
+            is_cond = False
+
+        return(cond_uncond[0], cond_uncond[1])
+
 
 NODE_CLASS_MAPPINGS = {
     "InstantIDModelLoader": InstantIDModelLoader,
     "InstantIDFaceAnalysis": InstantIDFaceAnalysis,
     "ApplyInstantID": ApplyInstantID,
+    "ApplyInstantIDAdvanced": ApplyInstantIDAdvanced,
     "FaceKeypointsPreprocessor": FaceKeypointsPreprocessor,
+
+    "InstantIDAttentionPatch": InstantIDAttentionPatch,
+    "ApplyInstantIDControlNet": ApplyInstantIDControlNet,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InstantIDModelLoader": "Load InstantID Model",
     "InstantIDFaceAnalysis": "InstantID Face Analysis",
     "ApplyInstantID": "Apply InstantID",
+    "ApplyInstantIDAdvanced": "Apply InstantID Advanced",
     "FaceKeypointsPreprocessor": "Face Keypoints Preprocessor",
+
+    "InstantIDAttentionPatch": "InstantID Patch Attention",
+    "ApplyInstantIDControlNet": "InstantID Apply ControlNet",
 }
